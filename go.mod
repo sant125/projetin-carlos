@@ -1,4 +1,4 @@
-module projetin-carlos/v
+module projetin-carlos
 
 go 1.26.1
 
