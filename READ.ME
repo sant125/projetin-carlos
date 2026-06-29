@@ -1,7 +1,47 @@
 infra com localstack, env local pra auth, inciializada com localstack cli.
 
-prox commits, iremos implementar controle de cadeiras entre recepcao e consumer via dynamodb, incremental, atomico
+provisionamento de sqs e dynamodb via tf, apontando pro localstack
 
-heartbet entre worker e recepcao pra deteccao de jobs concluidos, acordado ou nao
+controle de cadeiras entre recepcao e worker via dynamodb, counter atomico com ADD e ConditionExpression
 
-provisionamento de sqs via tf, no momento via cli apenas com --endpoint-url apontando pro localstack
+heartbeat entre worker e recepcao pra saber estado do barbeiro (dormindo, cortando, terminou), persistido no dynamo com ttl
+
+worker consome da fila com long polling, ocupa cadeira, corta, libera cadeira, deleta msg
+
+recepcao expoe GET /stats com cadeiras_ocupadas e estado dos workers
+
+## demo
+
+```bash
+# 1. sobe recepcao e worker com logs
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1 go run ./cmd/recepcao/ 2>&1 
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1 go run ./cmd/worker/ 2>&1
+
+# 2. acompanha os logs ao vivo
+tail -f recep.log prod.log
+
+# 3. em outro terminal, dispara clientes
+go run ./cmd/producer/ -total 6
+
+# 4. ve o estado da barbearia
+curl -s localhost:8080/stats | jq .
+
+# 5. polla stats a cada 2s pra ver os estados mudando ao vivo
+watch -n 2 'curl -s localhost:8080/stats | jq .'
+
+```
+
+
+proposta do trabalho, 
+
+## refs
+
+- dynamodb UpdateItem ADD atomico: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.UpdateExpressions.html#Expressions.UpdateExpressions.ADD
+- dynamodb ConditionExpression: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html
+- dynamodb TTL: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html
+- dynamodb single table design: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-general-nosql-design.html
+- sqs long polling: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-short-and-long-polling.html
+- sqs fifo dedup: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-exactly-once-processing.html
+- sqs visibility timeout: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html
+- aws sdk go v2 dynamodb: https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/service/dynamodb
+- aws sdk go v2 sqs: https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/service/sqs

@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,34 +18,39 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	sqsTypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
 // temq receber a request do producer, ou seja subir o server na porta q pssamos com env, unmarshal na reques criando uma struct q recebe os valores asssaod,s caso esteja errada , retornar 404/malformed json sla, expormos stats pra sabermos como esta as cadeiras/barbeiro, sdk do
 func main() {
+	//inciializando cortes validos, urlsqs, localstack
+	queueURL := getenvString("SQS_QUEUE_URL", "http://localhost:4566/000000000000/barbearia.fifo")
+	validCuts := getenvCuts("VALID_CUTS", "moicano, topete, blindadao")
+	endpoint := getenvString("AWS_ENDPOINT", "http://localhost:4566")
+
 	//inicializando config pra client for sqs
 	ctx := context.Background()
-	cfg, err := config.LoadDefaultConfig(ctx) //pega perm - access key aq
+	cfg, err := config.LoadDefaultConfig(ctx) //pega perm - access key aq ou role
 	if err != nil {
 		fmt.Println("erro ao carregar as config pra chamar aws api")
 		os.Exit(1)
 	}
-	sqsClient := sqs.NewFromConfig(cfg, func(o *sqs.Options) { //sqs client
-		o.BaseEndpoint = aws.String("http://localhost:4566")
-	})
 
-	endpoint := getenvString("AWS_ENDPOINT", "http://localhost:4566")
+	sqsClient := sqs.NewFromConfig(cfg, func(o *sqs.Options) { //sqs client
+		o.BaseEndpoint = aws.String(endpoint)
+	})
 	dynamoClient := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
 		o.BaseEndpoint = aws.String(endpoint)
 	})
 
-	//inciializando cortes validos
-	queueURL := getenvString("SQS_QUEUE_URL", "http://localhost:4566/000000000000/barbearia.fifo")
-	validCuts := getenvCuts("VALID_CUTS", "moicano, topete, blindadao")
-
 	//inciializando srv http , mux é um multiplexer http que faz match em paths e repassa aos handlers(funcoes corretas)
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /appointments", makeAppointmentHandler(validCuts, sqsClient, queueURL)) //preciso passar um http.HandlerFunc pra isso, la embaixo tenhgo acesso ao validCuts
-	tableName := getenvString("DYNAMO_TABLE", "barbeiros")
+	tableName := getenvString("DYNAMO_TABLE", "barbearia") //mesma tabela do worker, single table design — pk diferencia (cadeiras vs worker#id)
+
+	//sincroniza cadeiras com a fila no startup, se a recepcao morreu o counter pode ter ficado sujo
+	sincronizarCadeiras(ctx, sqsClient, queueURL, dynamoClient, tableName)
+
+	mux.HandleFunc("POST /appointments", makeAppointmentHandler(validCuts, sqsClient, queueURL, dynamoClient, tableName))
 	mux.HandleFunc("POST /heartbeat", makeHeartbeatHandler(dynamoClient, tableName))
 	mux.HandleFunc("GET /stats", makeStatsHandler(dynamoClient, tableName))
 	fmt.Println("subindo o server caralhoou,aceitando post no /appointments")
@@ -84,9 +91,10 @@ func getenvString(key, fallback string) string {
 type AppointmentRequest struct {
 	ClientName string `json:"client_name"`
 	Haircut    string `json:"haircut"`
+	CreatedAt  int64  `json:"created_at,omitempty"` //timestamp pra cada msg ser unica na fila fifo (dedup por hash do body)
 }
 
-func makeAppointmentHandler(validCuts []string, sqsClient *sqs.Client, queueURL string) http.HandlerFunc {
+func makeAppointmentHandler(validCuts []string, sqsClient *sqs.Client, queueURL string, dynamoClient *dynamodb.Client, tableName string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req AppointmentRequest
 		err := json.NewDecoder(r.Body).Decode(&req)
@@ -98,10 +106,18 @@ func makeAppointmentHandler(validCuts []string, sqsClient *sqs.Client, queueURL 
 			http.Error(w, "corte invalido cria", http.StatusUnprocessableEntity)
 			return
 		}
+		//tenta ocupar cadeira antes de enfileirar, se lotou nem manda pro sqs
+		if !ocuparCadeira(r.Context(), dynamoClient, tableName) {
+			http.Error(w, "barbearia lotada cria, volta depois", http.StatusServiceUnavailable)
+			return
+		}
+		req.CreatedAt = time.Now().UnixNano()
 		if sendToQueue(r.Context(), sqsClient, queueURL, req) {
 			w.WriteHeader(http.StatusAccepted)
 			fmt.Fprintf(w, "agendado cria! corte aceito")
 		} else {
+			//se falhou ao enfileirar, libera a cadeira q acabou de ocupar
+			liberarCadeira(r.Context(), dynamoClient, tableName)
 			http.Error(w, "falha ao enfileirar", http.StatusInternalServerError)
 		}
 	}
@@ -124,6 +140,39 @@ func sendToQueue(ctx context.Context, sqsClient *sqs.Client, queueURL string, re
 	}
 	fmt.Println("event=sqs.sent client=", req.ClientName, "haircut=", req.Haircut)
 	return true
+}
+
+// sincroniza cadeiras com o numero de msgs na fila, a fila eh a fonte de verdade
+func sincronizarCadeiras(ctx context.Context, sqsClient *sqs.Client, queueURL string, dynamoClient *dynamodb.Client, table string) {
+	result, err := sqsClient.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
+		QueueUrl: aws.String(queueURL),
+		AttributeNames: []sqsTypes.QueueAttributeName{
+			sqsTypes.QueueAttributeNameApproximateNumberOfMessages,
+			sqsTypes.QueueAttributeNameApproximateNumberOfMessagesNotVisible,
+		},
+	})
+	if err != nil {
+		fmt.Println("event=sync_cadeiras.failed error=", err)
+		return
+	}
+
+	//msgs visiveis (esperando) + nao visiveis (sendo processadas pelo worker)
+	visiveis, _ := strconv.Atoi(result.Attributes[string(sqsTypes.QueueAttributeNameApproximateNumberOfMessages)])
+	emProcesso, _ := strconv.Atoi(result.Attributes[string(sqsTypes.QueueAttributeNameApproximateNumberOfMessagesNotVisible)])
+	total := visiveis + emProcesso
+
+	_, err = dynamoClient.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(table),
+		Item: map[string]types.AttributeValue{
+			"pk":                &types.AttributeValueMemberS{Value: "cadeiras"},
+			"cadeiras_ocupadas": &types.AttributeValueMemberN{Value: strconv.Itoa(total)},
+		},
+	})
+	if err != nil {
+		fmt.Println("event=sync_cadeiras.dynamo_failed error=", err)
+		return
+	}
+	fmt.Printf("event=sync_cadeiras ok visiveis=%d em_processo=%d total=%d\n", visiveis, emProcesso, total)
 }
 
 type HeartbeatRequest struct {
@@ -157,15 +206,84 @@ func makeHeartbeatHandler(dynamoClient *dynamodb.Client, tableName string) http.
 			return
 		}
 
+		//worker terminou o corte, libera cadeira
+		if req.Estado == "terminou" {
+			liberarCadeira(r.Context(), dynamoClient, tableName)
+		}
+
 		fmt.Printf("event=heartbeat.received worker_id=%s estado=%s\n", req.WorkerID, req.Estado)
 		w.WriteHeader(http.StatusOK)
 	}
 }
 
+// ADD +1 atomico, so ocupa se tem vaga
+func ocuparCadeira(ctx context.Context, client *dynamodb.Client, table string) bool {
+	_, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(table),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "cadeiras"},
+		},
+		UpdateExpression: aws.String("ADD cadeiras_ocupadas :inc"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":inc": &types.AttributeValueMemberN{Value: "1"},
+			":max": &types.AttributeValueMemberN{Value: "3"},
+		},
+		ConditionExpression: aws.String("attribute_not_exists(cadeiras_ocupadas) OR cadeiras_ocupadas < :max"),
+	})
+	if err != nil {
+		var condErr *types.ConditionalCheckFailedException
+		if errors.As(err, &condErr) {
+			return false
+		}
+		fmt.Println("event=dynamo.ocupar_failed error=", err)
+		return false
+	}
+	return true
+}
+
+// ADD -1 atomico, so libera se tem cadeira ocupada (nao deixa ir negativo)
+func liberarCadeira(ctx context.Context, client *dynamodb.Client, table string) {
+	_, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(table),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "cadeiras"},
+		},
+		UpdateExpression:    aws.String("ADD cadeiras_ocupadas :dec"),
+		ConditionExpression: aws.String("cadeiras_ocupadas > :zero"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":dec":  &types.AttributeValueMemberN{Value: "-1"},
+			":zero": &types.AttributeValueMemberN{Value: "0"},
+		},
+	})
+	if err != nil {
+		fmt.Println("event=dynamo.liberar_failed error=", err)
+	}
+}
+
 func makeStatsHandler(dynamoClient *dynamodb.Client, tableName string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// scan na tabela pegando todos os itens com pk começando em "worker#"
-		result, err := dynamoClient.Scan(r.Context(), &dynamodb.ScanInput{
+		ctx := r.Context()
+
+		//pega counter de cadeiras
+		cadeirasResult, err := dynamoClient.GetItem(ctx, &dynamodb.GetItemInput{
+			TableName: aws.String(tableName),
+			Key: map[string]types.AttributeValue{
+				"pk": &types.AttributeValueMemberS{Value: "cadeiras"},
+			},
+		})
+		if err != nil {
+			fmt.Println("event=stats.cadeiras_failed error=", err)
+			http.Error(w, "falha ao buscar cadeiras", http.StatusInternalServerError)
+			return
+		}
+
+		ocupadas := "0"
+		if v, ok := cadeirasResult.Item["cadeiras_ocupadas"]; ok {
+			ocupadas = v.(*types.AttributeValueMemberN).Value
+		}
+
+		//pega todos os workers
+		workersResult, err := dynamoClient.Scan(ctx, &dynamodb.ScanInput{
 			TableName:        aws.String(tableName),
 			FilterExpression: aws.String("begins_with(pk, :prefix)"),
 			ExpressionAttributeValues: map[string]types.AttributeValue{
@@ -173,19 +291,27 @@ func makeStatsHandler(dynamoClient *dynamodb.Client, tableName string) http.Hand
 			},
 		})
 		if err != nil {
-			fmt.Println("event=stats.dynamo_failed error=", err)
-			http.Error(w, "falha ao buscar estatísticas", http.StatusInternalServerError)
+			fmt.Println("event=stats.workers_failed error=", err)
+			http.Error(w, "falha ao buscar workers", http.StatusInternalServerError)
 			return
 		}
 
-		// montar slice de resposta com worker_id, estado, last_seen
-		var resposta []map[string]interface{}
-		for _, item := range result.Items {
-			resposta = append(resposta, map[string]interface{}{
+		//converte unix pra horario legivel utc-3
+		brZone := time.FixedZone("BRT", -3*60*60)
+
+		var workers []map[string]interface{}
+		for _, item := range workersResult.Items {
+			ts, _ := strconv.ParseInt(item["last_seen"].(*types.AttributeValueMemberN).Value, 10, 64)
+			workers = append(workers, map[string]interface{}{
 				"worker_id": item["pk"].(*types.AttributeValueMemberS).Value,
 				"estado":    item["estado"].(*types.AttributeValueMemberS).Value,
-				"last_seen": item["last_seen"].(*types.AttributeValueMemberN).Value,
+				"last_seen": time.Unix(ts, 0).In(brZone).Format("02/01/2006 15:04:05"),
 			})
+		}
+
+		resposta := map[string]interface{}{
+			"cadeiras_ocupadas": ocupadas,
+			"workers":           workers,
 		}
 
 		w.Header().Set("Content-Type", "application/json")

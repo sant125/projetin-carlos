@@ -1,5 +1,12 @@
-# binarios compilados na raiz
+# binarios compilados
 /worker
 /producer
 /recepcao
+/bin/
 .env
+*.log
+
+# terraform
+infra/.terraform/
+infra/terraform.tfstate
+infra/terraform.tfstate.backup
