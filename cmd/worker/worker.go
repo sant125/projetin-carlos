@@ -23,7 +23,7 @@ type AppointmentRequest struct {
 }
 
 func main() {
-	ctx := context.Background()
+	ctx := context.Background()               //sabermos a origem do start/pra pararmos toda go-rountine/processos num sigkill
 	cfg, err := config.LoadDefaultConfig(ctx) //mesma config do recepcao, pega access key do env/profile
 	if err != nil {
 		fmt.Println("event=worker.config_failed error=", err)
@@ -32,7 +32,7 @@ func main() {
 
 	endpoint := getenv("AWS_ENDPOINT", "http://localhost:4566")
 
-	sqsClient := sqs.NewFromConfig(cfg, func(o *sqs.Options) { //sqs client, msm pattern do recepcao
+	sqsClient := sqs.NewFromConfig(cfg, func(o *sqs.Options) { //sqs client, msm pattern do recepcao - provavéç recebe essa function com default com options defaults, aqui a gnt personaliza passando localstack
 		o.BaseEndpoint = aws.String(endpoint)
 	})
 
@@ -40,7 +40,7 @@ func main() {
 		o.BaseEndpoint = aws.String(endpoint)
 	})
 
-	queueURL := getenv("SQS_QUEUE_URL", "http://localhost:4566/000000000000/barbearia")
+	queueURL := getenv("SQS_QUEUE_URL", "http://localhost:4566/000000000000/barbearia.fifo")
 	workerID := getenv("WORKER_ID", "barbeiro-1")
 	recepcaoURL := getenv("RECEPCAO_URL", "http://localhost:8080")
 	tableName := getenv("DYNAMO_TABLE", "barbearia")
@@ -75,6 +75,7 @@ func main() {
 		}
 
 		//tenta ocupar cadeira no dynamo, se lotou nao deleta msg e ela volta pra fila sozinha pelo visibility timeout
+		//poderia encaminharmos ao dlq, tipo clientes que sairam cai na dlq pra validarmos clientes perdidos, e o motivo se der, sla cadeiras cheias
 		if !ocuparCadeira(ctx, dynamoClient, tableName) {
 			fmt.Printf("event=worker.lotado client=%s\n", req.ClientName)
 			time.Sleep(5 * time.Second)
@@ -93,7 +94,7 @@ func main() {
 	}
 }
 
-//ADD +1 atomico no dynamo, so incrementa se cadeiras_ocupadas < max, se ja lotou retorna ConditionalCheckFailedException
+// ADD +1 atomico no dynamo, so incrementa se cadeiras_ocupadas < max, se ja lotou retorna ConditionalCheckFailedException
 func ocuparCadeira(ctx context.Context, client *dynamodb.Client, table string) bool {
 	_, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(table),
@@ -118,7 +119,7 @@ func ocuparCadeira(ctx context.Context, client *dynamodb.Client, table string) b
 	return true
 }
 
-//ADD com valor negativo decrementa, atomico sem lock
+// ADD com valor negativo decrementa, atomico sem lock
 func liberarCadeira(ctx context.Context, client *dynamodb.Client, table string) {
 	_, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(table),
@@ -135,7 +136,7 @@ func liberarCadeira(ctx context.Context, client *dynamodb.Client, table string) 
 	}
 }
 
-//post pro recepcao informando estado do barbeiro, temq implementar POST /heartbeat e GET /stats la no recepcao pra receber isso
+// post pro recepcao informando estado do barbeiro, temq implementar POST /heartbeat e GET /stats la no recepcao pra receber isso
 func sendHeartbeat(recepcaoURL, workerID, estado string) {
 	body := fmt.Sprintf(`{"worker_id":%q,"estado":%q}`, workerID, estado)
 	resp, err := http.Post(
